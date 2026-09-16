@@ -1,5 +1,10 @@
 # attackmap-analyzer-python
 
+> [!NOTE]
+> **Development is paused.** This project is not under active development.
+> The code remains available for reference, and security reports are still
+> welcome at [security@mlaify.io](mailto:security@mlaify.io).
+
 Comprehensive Python ecosystem analyzer for [AttackMap](https://github.com/mlaify/AttackMap).
 
 This plugin is **additive** over AttackMap's built-in `python-web` analyzer. The built-in handles FastAPI / Flask routes via the core scanner; this plugin adds everything else.
