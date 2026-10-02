@@ -82,7 +82,7 @@ attackmap analyze /path/to/python/repo --module python
 
 AttackMap ships with a `python-web` built-in that handles FastAPI / Flask via the core scanner. When this plugin is installed, both analyzers run on every Python repo. AttackMap's overlay deduplication merges their output so users see a single unified set of findings — no double-counting.
 
-This plugin runs at `priority=15` (slightly higher than the built-in's 20), so its richer output lands first.
+This plugin runs at `priority=10`. AttackMap runs analyzers in `(priority, name)` order across built-ins and plugins and merges first-seen-wins, so this plugin runs before the built-in (`priority=20`) and its richer output wins where they overlap.
 
 ## License
 
