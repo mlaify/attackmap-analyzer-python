@@ -33,7 +33,7 @@ Comprehensive Python ecosystem coverage, **additive over the built-in `python-we
 - **WebSocket consumer routing** in Django Channels — `routing.py` patterns differ from urls.py.
 
 ## Coexistence with built-in
-The built-in `python-web` analyzer (`priority=20`) ships in AttackMap core and runs on every Python repo — it covers FastAPI + Flask routes, basic auth keyword sweeps, and `os.getenv` secrets via the core scanner. This plugin runs at `priority=15` (slightly higher) so its richer output lands first; AttackMap's overlay deduplication merges the two analyzers' results into a single unified set.
+The built-in `python-web` analyzer (`priority=20`) ships in AttackMap core and runs on every Python repo — it covers FastAPI + Flask routes, basic auth keyword sweeps, and `os.getenv` secrets via the core scanner. This plugin runs at `priority=10` (lower runs first; core orders analyzers by `(priority, name)` and merges first-seen-wins) so its richer output lands first; AttackMap's overlay deduplication merges the two analyzers' results into a single unified set.
 
 ## Confidence policy
 - Hash-class auth (passlib argon2/bcrypt/scrypt, argon2-cffi, bcrypt standalone) → 0.9

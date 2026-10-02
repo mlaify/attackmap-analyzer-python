@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -684,3 +685,45 @@ def test_full_django_drf_signal_set(tmp_path: Path) -> None:
 
     # Line numbers populated on routes
     assert all(r.line is not None for r in result.routes)
+
+
+# ---------- Repo walking (mlaify/AttackMap#253) ----------
+
+
+def _write_django_urls(repo: Path) -> None:
+    urls = repo / "app" / "urls.py"
+    urls.parent.mkdir(parents=True)
+    urls.write_text(
+        "from django.urls import path\n"
+        "from . import views\n"
+        "\n"
+        "urlpatterns = [\n"
+        "    path('users/', views.users, name='users'),\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+
+def test_repo_under_skip_dir_names_is_still_analyzed(tmp_path: Path) -> None:
+    # "build" and "out" are skip dirs; they must only count inside the repo.
+    repo = tmp_path / "build" / "out" / "repo"
+    _write_django_urls(repo)
+    analyzer = PythonAnalyzer()
+    assert analyzer.detect(repo) is True
+    result = analyzer.analyze(repo)
+    assert result.files_scanned == 1
+    assert {r.path for r in result.routes} == {"/users/"}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinked_file_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    _write_django_urls(outside)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "linked_urls.py").symlink_to(outside / "app" / "urls.py")
+    analyzer = PythonAnalyzer()
+    assert analyzer.detect(repo) is False
+    result = analyzer.analyze(repo)
+    assert result.files_scanned == 0
+    assert result.routes == []

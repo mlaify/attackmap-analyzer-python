@@ -36,6 +36,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -50,21 +52,9 @@ from .contracts import (
 )
 
 CODE_SUFFIXES = {".py"}
-SKIP_DIRS = {
-    ".venv",
-    "venv",
-    "env",
-    ".tox",
-    "__pycache__",
-    ".pytest_cache",
-    "dist",
-    "build",
-    "node_modules",
-    ".git",
-    ".mypy_cache",
-    ".ruff_cache",
-    "site-packages",
-}
+# Python-specific directories on top of the SDK defaults. Matched against
+# directory names inside the repo only (attackmap.sdk.fs, mlaify/AttackMap#253).
+SKIP_DIRS = DEFAULT_SKIP_DIRS | {"env", ".ruff_cache", "site-packages"}
 _SNIPPET_MAX_CHARS = 160
 
 
@@ -232,12 +222,10 @@ SECRET_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 
-def _line_of(content: str, offset: int) -> int:
-    if offset <= 0:
-        return 1
-    return content.count("\n", 0, offset) + 1
-
-
+# Kept rather than attackmap.sdk.line_snippet: this takes a match offset and
+# splits on "\n" only, so it stays consistent with line_of() on files that
+# contain form feeds or other str.splitlines() separators, and it costs
+# O(line) per match instead of O(file).
 def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CHARS) -> str:
     line_start = content.rfind("\n", 0, offset) + 1
     line_end = content.find("\n", offset)
@@ -249,12 +237,9 @@ def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CH
     return line
 
 
-def _name_from_pyproject(pyproject_path: Path) -> str | None:
-    if not pyproject_path.exists():
-        return None
-    try:
-        text = pyproject_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+def _name_from_pyproject(pyproject_path: Path, root: Path | None = None) -> str | None:
+    text = read_source(pyproject_path, root=root)
+    if text is None:
         return None
     # Try [project] name = "..." (PEP 621)
     match = re.search(r'\[project\][^\[]*?name\s*=\s*["\']([^"\']+)["\']', text, re.DOTALL)
@@ -267,12 +252,9 @@ def _name_from_pyproject(pyproject_path: Path) -> str | None:
     return None
 
 
-def _name_from_setup_py(setup_path: Path) -> str | None:
-    if not setup_path.exists():
-        return None
-    try:
-        text = setup_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+def _name_from_setup_py(setup_path: Path, root: Path | None = None) -> str | None:
+    text = read_source(setup_path, root=root)
+    if text is None:
         return None
     match = re.search(r'\bname\s*=\s*["\']([^"\']+)["\']', text)
     if match:
@@ -280,12 +262,9 @@ def _name_from_setup_py(setup_path: Path) -> str | None:
     return None
 
 
-def _name_from_setup_cfg(setup_cfg_path: Path) -> str | None:
-    if not setup_cfg_path.exists():
-        return None
-    try:
-        text = setup_cfg_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+def _name_from_setup_cfg(setup_cfg_path: Path, root: Path | None = None) -> str | None:
+    text = read_source(setup_cfg_path, root=root)
+    if text is None:
         return None
     match = re.search(r'\[metadata\][^\[]*?name\s*=\s*([^\s\n]+)', text, re.DOTALL)
     if match:
@@ -334,7 +313,10 @@ class PythonAnalyzer:
         scope="Python projects (pyproject.toml, setup.py, manage.py, or any *.py tree). Additive over the built-in python-web analyzer.",
         targets=["python", "django", "starlette", "aiohttp", "sanic", "litestar"],
         languages=["python"],
-        priority=15,  # Slightly higher priority than the built-in (20) — runs first; dedup handles overlap.
+        # Lower number runs first: core orders analyzers by (priority, name) across
+        # built-ins and plugins, and merge is first-seen-wins, so this runs before
+        # the built-in python-web (20) and its richer output wins on overlap.
+        priority=10,
         experimental=False,
         enabled_by_default=True,
     )
@@ -352,11 +334,7 @@ class PythonAnalyzer:
         for marker in ("pyproject.toml", "setup.py", "setup.cfg", "manage.py", "Pipfile"):
             if (root / marker).exists():
                 return True
-        for path in root.rglob("*.py"):
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            return True
-        return False
+        return next(iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS), None) is not None
 
     def analyze(self, repo_path: str | Path) -> ScanResult:
         root = Path(repo_path).resolve()
@@ -370,7 +348,7 @@ class PythonAnalyzer:
             (_name_from_setup_py, "setup.py"),
             (_name_from_setup_cfg, "setup.cfg"),
         ):
-            project_name = name_provider(root / marker)
+            project_name = name_provider(root / marker, root)
             if project_name:
                 self._append_unique_service(result, f"package:{project_name}", marker)
                 break
@@ -378,22 +356,16 @@ class PythonAnalyzer:
         if (root / "manage.py").exists():
             self._append_unique_service(result, "framework:django", "manage.py")
 
-        for file_path in root.rglob("*.py"):
-            if not file_path.is_file():
-                continue
-            if any(part in SKIP_DIRS for part in file_path.parts):
+        for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
+            content = read_source(file_path, root=root)
+            if content is None:
                 continue
 
             result.files_scanned += 1
             if "python" not in result.languages:
                 result.languages.append("python")
 
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-
-            relative = str(file_path.relative_to(root))
+            relative = rel(file_path, root)
             self._extract_routes(content, relative, result)
             self._extract_databases(content, relative, result)
             self._extract_django_settings(content, relative, result)
@@ -413,24 +385,24 @@ class PythonAnalyzer:
         if _has_django_import(content) and _is_django_urls(content):
             for match in DJANGO_PATH_PATTERN.finditer(content):
                 path = "/" + match.group(1).lstrip("/")
-                self._append_unique_route(result, path, "ANY", relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
             for match in DJANGO_RE_PATH_PATTERN.finditer(content):
                 path = match.group(1)
-                self._append_unique_route(result, path, "ANY", relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
             for match in DJANGO_LEGACY_URL_PATTERN.finditer(content):
                 path = match.group(1)
-                self._append_unique_route(result, path, "ANY", relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
 
         # Django REST Framework routers
         if _has_drf_import(content):
             for match in DRF_ROUTER_PATTERN.finditer(content):
                 path = "/" + match.group(1).lstrip("/")
-                self._append_unique_route(result, path, "ANY", relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
             for match in DJANGO_API_VIEW_PATTERN.finditer(content):
                 methods = re.findall(r'[\'"]([A-Z]+)[\'"]', match.group(1))
                 # No path on @api_view alone — caller must pair with path() in urls.py.
                 # We emit the methods as a low-signal hint via framework_hint to capture intent.
-                line = _line_of(content, match.start())
+                line = line_of(content, match.start())
                 for method in methods:
                     self._append_unique_framework(
                         result, f"drf_api_view:{method}", relative, line,
@@ -443,7 +415,7 @@ class PythonAnalyzer:
                 path = match.group(1)
                 rest = match.group("rest") or ""
                 methods_match = re.search(r'methods\s*=\s*\[([^\]]+)\]', rest)
-                line = _line_of(content, match.start())
+                line = line_of(content, match.start())
                 if methods_match:
                     methods = [m.upper() for m in re.findall(r'[\'"]([A-Z]+)[\'"]', methods_match.group(1))]
                 else:
@@ -452,34 +424,34 @@ class PythonAnalyzer:
                     self._append_unique_route(result, path, method, relative, line)
             for match in STARLETTE_WS_PATTERN.finditer(content):
                 path = match.group(1)
-                self._append_unique_route(result, path, "WS", relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, "WS", relative, line_of(content, match.start()))
 
         # AIOHTTP — gated by import presence so generic `add_get`/`web.get` doesn't fire.
         if _has_aiohttp_import(content):
             for match in AIOHTTP_ADD_PATTERN.finditer(content):
                 method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
             for match in AIOHTTP_WEB_HELPER_PATTERN.finditer(content):
                 method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # Sanic — gated by sanic import
         if _has_sanic_import(content):
             for match in SANIC_DECORATOR_PATTERN.finditer(content):
                 method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # Litestar / Starlite — gated to avoid false positives on generic `@get(...)` decorators.
         if _has_litestar_or_starlite_import(content):
             for match in LITESTAR_DECORATOR_PATTERN.finditer(content):
                 method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # Flask add_url_rule (additive — built-in covers @app.route)
         if "flask" in content.lower() or "Blueprint(" in content:
             for match in FLASK_ADD_URL_RULE_PATTERN.finditer(content):
                 path = match.group(1)
-                self._append_unique_route(result, path, "ANY", relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
@@ -488,7 +460,7 @@ class PythonAnalyzer:
                 continue
             self._append_unique_database(
                 result, kind, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -506,7 +478,7 @@ class PythonAnalyzer:
             }.get(dialect, "sql")
             self._append_unique_database(
                 result, kind, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -525,7 +497,7 @@ class PythonAnalyzer:
             }.get(engine_short, "sql")
             self._append_unique_database(
                 result, kind, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
         # INSTALLED_APPS — extract third-party / local apps as service hints
@@ -545,7 +517,7 @@ class PythonAnalyzer:
                 continue
             self._append_unique_auth(
                 result, hint, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
                 confidence,
             )
@@ -556,7 +528,7 @@ class PythonAnalyzer:
                 name = match.group(1)
                 self._append_unique_secret(
                     result, name, relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
         # pydantic-settings BaseSettings: class Settings(BaseSettings): jwt_secret: str = ...
@@ -569,7 +541,7 @@ class PythonAnalyzer:
                 name = match.group(1)
                 self._append_unique_secret(
                     result, name, relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
 
@@ -581,7 +553,7 @@ class PythonAnalyzer:
                     continue
                 self._append_unique_external(
                     result, target, relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
 
@@ -592,7 +564,7 @@ class PythonAnalyzer:
                 continue
             self._append_unique_framework(
                 result, name, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -603,7 +575,7 @@ class PythonAnalyzer:
                 continue
             self._append_unique_entrypoint(
                 result, hint, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
