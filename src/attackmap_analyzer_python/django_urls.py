@@ -18,13 +18,23 @@ longer emitted as a route. An include that can't be resolved inside the repo
 (``include("allauth.urls")``, ``include(get_model_urls(...))``) is still
 emitted as its prefix so the mounted surface stays visible.
 
-Precision over cleverness: a list, router or module that is never reached
-from a root URLconf is still emitted, unprefixed (the pre-#2 behaviour), so a
-dynamic mount the graph can't follow never loses a route.
+Within the bounds below, no route the regex extractor used to report is
+lost:
 
-Everything is bounded (depth, prefixes per list, steps, routes) and nothing
-here touches the filesystem: module references resolve only against the files
-the analyzer already read.
+- A pattern list is the *union* of everything assigned to it. Reassignments,
+  if/else and try/except alternatives, and wrappers
+  (``urlpatterns = decorate_urlpatterns(urlpatterns, ...)``) all add; nothing
+  replaces. A route that every branch replaces is still reported, which trades
+  a little precision for recall.
+- A list, router or module that is never reached from a root URLconf is still
+  emitted, unprefixed (the pre-#2 behaviour), so a dynamic mount the graph
+  can't follow keeps its routes.
+
+Everything is bounded: entries per list and per file, registrations per
+router, include depth, mounts per list, steps (router registrations included)
+and routes. Hitting a bound truncates instead of hanging. Nothing here touches
+the filesystem: module references resolve only against the files the analyzer
+already read.
 """
 
 from __future__ import annotations
@@ -49,6 +59,11 @@ _PUBLIC_WRAPPERS = {"login_not_required"}
 _MAX_WRAP_DEPTH = 6
 
 MAX_DEPTH = 12
+# Per-file model bounds: entries in one pattern list, entries across a file's
+# lists, and registrations on one router. A real URLconf is far below these.
+MAX_LIST_ENTRIES = 5_000
+MAX_FILE_ENTRIES = 20_000
+MAX_ROUTER_REGISTRATIONS = 5_000
 MAX_PREFIXES_PER_LIST = 64
 MAX_STEPS = 200_000
 MAX_ROUTES = 50_000
@@ -87,6 +102,7 @@ class UrlConf:
     routers: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
     # bound name → (relative-import level, module, imported attribute or "")
     imports: dict[str, tuple[int, str, str]] = field(default_factory=dict)
+    truncated: bool = False  # a per-file cap was hit
 
 
 @dataclass
@@ -119,6 +135,8 @@ class _Builder:
     def __init__(self, rel: str, *, is_urlconf: bool, drf: bool):
         self.conf = UrlConf(rel=rel, is_urlconf=is_urlconf, emit_unmounted_routers=drf or is_urlconf)
         self.consumed: set[int] = set()
+        self._list_ids: dict[str, set[int]] = {}
+        self._total = 0
 
     def build(self, tree: ast.Module) -> UrlConf:
         for stmt in _module_statements(tree.body):
@@ -135,7 +153,7 @@ class _Builder:
                 if entry is not None and entry.segment:
                     orphans.append(entry)
         if orphans and self.conf.is_urlconf:
-            self.conf.lists[_ORPHANS] = orphans
+            self._extend(_ORPHANS, orphans)
         return self.conf
 
     # -- statements --
@@ -165,7 +183,7 @@ class _Builder:
             name = stmt.target.id
             entries = self._entries(stmt.value, name, 0)
             if entries or name in conf.lists:
-                conf.lists.setdefault(name, []).extend(entries)
+                self._extend(name, entries)
         elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
             self._call_statement(stmt.value)
 
@@ -177,7 +195,25 @@ class _Builder:
             return
         entries = self._entries(value, name, 0)
         if entries or name == "urlpatterns" or (isinstance(value, (ast.List, ast.Tuple)) and not value.elts):
-            conf.lists[name] = entries
+            # Union, never replace: a reassignment, an if/else or try/except
+            # alternative, or `urlpatterns = wrap(urlpatterns)` keeps every
+            # route any branch defines (precision trade-off: a route replaced
+            # on every path is still reported).
+            self._extend(name, entries)
+
+    def _extend(self, name: str, entries: list[Entry]) -> None:
+        """Add entries to a list once each, within the per-list/per-file caps."""
+        target = self.conf.lists.setdefault(name, [])
+        ids = self._list_ids.setdefault(name, set())
+        for entry in entries:
+            if id(entry) in ids:
+                continue
+            if len(target) >= MAX_LIST_ENTRIES or self._total >= MAX_FILE_ENTRIES:
+                self.conf.truncated = True
+                return
+            ids.add(id(entry))
+            target.append(entry)
+            self._total += 1
 
     def _call_statement(self, call: ast.Call) -> None:
         func = call.func
@@ -191,7 +227,11 @@ class _Builder:
                 return
             # A locally built router, or one named like the conventional `router`.
             if owner in conf.routers or owner.lower().endswith("router"):
-                conf.routers.setdefault(owner, []).append((prefix, call.lineno))
+                regs = conf.routers.setdefault(owner, [])
+                if len(regs) < MAX_ROUTER_REGISTRATIONS:
+                    regs.append((prefix, call.lineno))
+                else:
+                    conf.truncated = True
             return
         if method in {"append", "extend", "insert"} and call.args:
             arg = call.args[-1]
@@ -200,7 +240,7 @@ class _Builder:
             else:
                 entries = self._entries(ast.List(elts=[arg], ctx=ast.Load()), owner, 0)
             if entries or owner in conf.lists:
-                conf.lists.setdefault(owner, []).extend(entries)
+                self._extend(owner, entries)
 
     # -- expressions --
 
@@ -223,9 +263,10 @@ class _Builder:
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             return self._entries(node.left, self_name, depth + 1) + self._entries(node.right, self_name, depth + 1)
         if isinstance(node, ast.Name):
-            if node.id == self_name and node.id in self.conf.lists:
-                # `urlpatterns = format_suffix_patterns(urlpatterns)` / `x = x + [...]`
-                return list(self.conf.lists[node.id])
+            if node.id == self_name:
+                # `urlpatterns = format_suffix_patterns(urlpatterns)` / `x = x + x`:
+                # the list already holds these (lists are unions), add nothing.
+                return []
             return [Entry("mount", getattr(node, "lineno", 0), segment="", target=Target("name", node.id))]
         if isinstance(node, ast.Attribute) and node.attr in {"urls", "urlpatterns"}:
             base = dotted(node.value)
@@ -236,12 +277,15 @@ class _Builder:
             if self._is_url_call(node):
                 entry = self._url_entry(node, depth + 1)
                 return [entry] if entry is not None else []
-            if call_name(node) in _PASSTHROUGH_FUNCS:
-                out = []
-                for arg in node.args:
-                    inner = arg.value if isinstance(arg, ast.Starred) else arg
-                    out.extend(self._entries(inner, self_name, depth + 1))
-                return out
+            # Known wrappers (`i18n_patterns`, `format_suffix_patterns`, ...) and
+            # unknown ones (`decorate_urlpatterns(api, login_required)`) alike:
+            # whatever pattern lists they're handed stay mounted. Non-pattern
+            # arguments resolve to nothing.
+            out = []
+            for arg in node.args:
+                inner = arg.value if isinstance(arg, ast.Starred) else arg
+                out.extend(self._entries(inner, self_name, depth + 1))
+            return out
         return []
 
     @staticmethod
@@ -372,12 +416,14 @@ class UrlGraph:
         self.confs = confs
         # Directories holding manage.py: Django's sys.path roots, tried first
         # when resolving an absolute dotted module.
-        self.project_dirs = sorted(project_dirs, key=lambda d: (-d.count("/"), d))
+        self._project_dirs = set(project_dirs)
+        self._anchor_cache: dict[str, list[str]] = {}
         self.routes: list[DjangoRoute] = []
         self._seen: set[tuple[str, str, int]] = set()
         self._expanded: set[tuple[str, str]] = set()
         self._prefix_count: dict[tuple[str, str], int] = {}
         self._mounted_routers: set[tuple[str, str]] = set()
+        self._router_mounts: set[tuple[str, str, str]] = set()
         self._steps = 0
         self.truncated = False
 
@@ -393,13 +439,7 @@ class UrlGraph:
         else:
             if not parts:
                 return None
-            ancestors: list[str] = []
-            d = posixpath.dirname(from_rel)
-            while d:
-                ancestors.append(d)
-                d = posixpath.dirname(d)
-            project = [p for p in self.project_dirs if p == "" or from_rel.startswith(p + "/")]
-            anchors = project + [""] + ancestors
+            anchors = self._absolute_anchors(from_rel)
         for anchor in anchors:
             stem = posixpath.join(anchor, *parts) if parts else anchor
             if not stem:
@@ -408,6 +448,25 @@ class UrlGraph:
                 if cand in self.confs:
                     return cand
         return None
+
+    def _absolute_anchors(self, from_rel: str) -> list[str]:
+        """manage.py directories above the file (deepest first), the repo
+        root, then the file's ancestors. Indexed, cached per directory."""
+        directory = posixpath.dirname(from_rel)
+        cached = self._anchor_cache.get(directory)
+        if cached is not None:
+            return cached
+        ancestors: list[str] = []
+        d = directory
+        while d:
+            ancestors.append(d)
+            d = posixpath.dirname(d)
+        project = [a for a in ancestors if a in self._project_dirs]
+        if "" in self._project_dirs:
+            project.append("")
+        anchors = list(dict.fromkeys(project + [""] + ancestors))
+        self._anchor_cache[directory] = anchors
+        return anchors
 
     def _import_module(self, conf: UrlConf, name: str) -> tuple[str | None, str]:
         """For a bound name: (module file it names or comes from, imported attr)."""
@@ -540,7 +599,15 @@ class UrlGraph:
                 self._expand_entry(conf, entry, prefix, depth, stack)
         elif kind == "router":
             self._mounted_routers.add((conf.rel, ref))
+            mount = (conf.rel, ref, join_segments(prefix))
+            if mount in self._router_mounts:
+                return  # the same router mounted at the same prefix again
+            self._router_mounts.add(mount)
             for segment, line in conf.routers.get(ref, []):
+                self._steps += 1
+                if self._steps > MAX_STEPS or len(self.routes) >= MAX_ROUTES:
+                    self.truncated = True
+                    return
                 self._emit(join_segments(prefix + [(segment, False)]), conf.rel, line)
 
     def _references(self) -> set[tuple[str, str]]:

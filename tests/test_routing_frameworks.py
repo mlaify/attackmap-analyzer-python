@@ -730,3 +730,154 @@ def test_django_regex_fallback_skips_empty_include(tmp_path: Path) -> None:
     ))
     # The "/" comes from the view on line 4, not the include on line 3.
     assert [(r.path, r.line) for r in PythonAnalyzer().analyze(tmp_path).routes] == [("/", 4)]
+
+
+# ---------- review follow-ups (python#9) ----------
+
+
+def test_django_self_concatenation_does_not_grow_exponentially(tmp_path: Path) -> None:
+    lines = ["from django.urls import path", "urlpatterns = [path('a/', v), path('b/', v)]"]
+    lines += ["urlpatterns = urlpatterns + urlpatterns"] * 40
+    lines += ["urlpatterns += urlpatterns"] * 40
+    lines += ["urlpatterns.extend(urlpatterns)"] * 40
+    _write(tmp_path, "urls.py", "\n".join(lines) + "\n")
+    start = time.monotonic()
+    assert _paths(tmp_path) == {"/a/", "/b/"}
+    assert time.monotonic() - start < 5
+
+
+def test_django_list_and_file_entry_caps(tmp_path: Path) -> None:
+    items = ", ".join(f"path('p{i}/', v)" for i in range(django_urls.MAX_LIST_ENTRIES + 500))
+    _write(tmp_path, "urls.py", f"from django.urls import path\nurlpatterns = [{items}]\n")
+    conf = django_urls.parse_urlconf(
+        (tmp_path / "urls.py").read_text(), "urls.py", is_urlconf=True, drf=False
+    )
+    assert conf is not None and conf.truncated
+    assert len(conf.lists["urlpatterns"]) == django_urls.MAX_LIST_ENTRIES
+
+
+def test_django_router_mounts_are_budgeted_and_deduped(tmp_path: Path) -> None:
+    regs = "\n".join(f"router.register('r{i}', V)" for i in range(3000))
+    mounts = ", ".join(["router.urls"] * 3000)
+    _write(tmp_path, "urls.py", (
+        "from django.urls import include, path\n"
+        "from rest_framework import routers\n"
+        "router = routers.DefaultRouter()\n"
+        f"{regs}\n"
+        f"urlpatterns = [path('api/', include(router.urls)), {mounts}]\n"
+        "urlpatterns += [path('api/', include(router.urls))]\n"
+    ))
+    start = time.monotonic()
+    paths = _paths(tmp_path)
+    assert time.monotonic() - start < 10
+    assert "/api/r0" in paths and "/r2999" in paths
+    assert len(paths) == 6000
+
+
+def test_django_router_steps_count_against_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(django_urls, "MAX_STEPS", 50)
+    conf = django_urls.UrlConf(rel="urls.py", is_urlconf=True, emit_unmounted_routers=True)
+    conf.routers["router"] = [(f"r{i}", 1) for i in range(1000)]
+    conf.lists["urlpatterns"] = [
+        django_urls.Entry("mount", 1, segment="", target=django_urls.Target("attr", "router", "urls"))
+    ]
+    graph = django_urls.UrlGraph({"urls.py": conf}, [])
+    routes = graph.expand()
+    assert graph.truncated
+    assert len([r for r in routes if r.path.startswith("/r")]) < 1000 + 60
+
+
+def test_django_include_anchor_lookup_is_indexed(tmp_path: Path) -> None:
+    """Many manage.py directories: each lookup walks the file's ancestors,
+    not every project dir."""
+    graph = django_urls.UrlGraph({}, [f"proj{i}" for i in range(20000)] + ["deep/site"])
+    start = time.monotonic()
+    for _ in range(2000):
+        graph._module_rel("deep/site/app/urls.py", 0, "shop.urls")
+    assert time.monotonic() - start < 2
+    assert graph._absolute_anchors("deep/site/app/urls.py")[:2] == ["deep/site", ""]
+
+
+def test_django_alternatives_and_wrappers_keep_routes(tmp_path: Path) -> None:
+    _write(tmp_path, "urls.py", (
+        "from django.conf import settings\n"
+        "from django.urls import path\n"
+        "if settings.FEATURE:\n"
+        "    urlpatterns = [path('feature/', v)]\n"
+        "else:\n"
+        "    urlpatterns = [path('fallback/', v)]\n"
+        "try:\n"
+        "    from extras import x\n"
+        "    urlpatterns = urlpatterns + [path('extra/', v)]\n"
+        "except ImportError:\n"
+        "    urlpatterns = urlpatterns + [path('no-extra/', v)]\n"
+        "api = [path('api/me/', v)]\n"
+        "urlpatterns = decorate_urlpatterns(urlpatterns, login_required)\n"
+        "urlpatterns += decorate_urlpatterns(api, login_required)\n"
+        "urlpatterns = [path('replaced/', v)]\n"
+    ))
+    assert _paths(tmp_path) == {
+        "/feature/", "/fallback/", "/extra/", "/no-extra/", "/api/me/", "/replaced/",
+    }
+
+
+def test_sanic_enum_methods_and_slash_normalization(tmp_path: Path) -> None:
+    _write(tmp_path, "app.py", (
+        "from http import HTTPMethod\n"
+        "from sanic import Sanic\n"
+        "app = Sanic('x')\n"
+        "@app.route('//a//b', methods=[HTTPMethod.DELETE, 'patch'])\n"
+        "async def h(request): ...\n"
+    ))
+    assert _routes(tmp_path) == {("/a/b", "DELETE"), ("/a/b", "PATCH")}
+
+
+def test_tornado_indirect_request_handler_subclass(tmp_path: Path) -> None:
+    _write(tmp_path, "app.py", (
+        "import tornado.web\n"
+        "class BaseView(tornado.web.RequestHandler):\n"
+        "    pass\n"
+        "class Middle(BaseView):\n"
+        "    pass\n"
+        "class Api(Middle):\n"
+        "    def post(self): ...\n"
+        "class PlainHelper:\n"
+        "    def get(self): ...\n"
+        "app = tornado.web.Application([(r'/api', Api), (r'/x', PlainHelper)])\n"
+    ))
+    assert _routes(tmp_path) == {("/api", "POST")}
+
+
+def test_litestar_conflicting_mount_auth_is_unknown(tmp_path: Path) -> None:
+    _write(tmp_path, "app.py", (
+        "from litestar import Controller, Litestar, Router, get\n"
+        "class C(Controller):\n"
+        "    path = '/c'\n"
+        "    @get('/x')\n"
+        "    async def x(self): ...\n"
+        "guarded = Router('/', route_handlers=[C], guards=[admin_only])\n"
+        "app = Litestar(route_handlers=[guarded, C])\n"
+    ))
+    routes = [r for r in PythonAnalyzer().analyze(tmp_path).routes if r.path == "/c/x"]
+    assert len(routes) == 1 and routes[0].auth == "unknown" and routes[0].guards == []
+
+
+def test_django_same_router_mount_is_walked_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(django_urls, "MAX_STEPS", 1500)
+    conf = django_urls.UrlConf(rel="urls.py", is_urlconf=True, emit_unmounted_routers=True)
+    conf.routers["router"] = [(f"r{i}", 1) for i in range(1000)]
+    mount = django_urls.Entry("mount", 1, segment="", target=django_urls.Target("attr", "router", "urls"))
+    conf.lists["urlpatterns"] = [mount] * 5
+    graph = django_urls.UrlGraph({"urls.py": conf}, [])
+    assert len(graph.expand()) == 1000
+    assert not graph.truncated
+
+
+def test_django_patterns_with_many_arguments_keep_prefix(tmp_path: Path) -> None:
+    urls = ", ".join(f"url(r'^p{i}/$', v)" for i in range(40))
+    _write(tmp_path, "urls.py", (
+        "from django.conf.urls import patterns, include, url\n"
+        "urlpatterns = patterns('', url(r'^tm/', include('tm_urls')))\n"
+    ))
+    _write(tmp_path, "tm_urls.py", f"from django.conf.urls import patterns, url\nurlpatterns = patterns('', {urls})\n")
+    assert _paths(tmp_path) == {f"/tm/p{i}/" for i in range(40)}

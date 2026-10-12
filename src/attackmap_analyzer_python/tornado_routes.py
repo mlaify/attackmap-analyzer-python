@@ -31,6 +31,7 @@ class HandlerClass:
     bases: list[str]
     methods: dict[str, bool] = field(default_factory=dict)  # VERB → @authenticated
     websocket: bool = False
+    direct: bool = False  # a base is named *Handler
 
 
 @dataclass
@@ -67,13 +68,14 @@ def parse_tornado(content: str, rel: str) -> TornadoFile | None:
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             bases = [dotted(b) or "" for b in node.bases]
-            if not any(b.endswith("Handler") for b in bases):
-                continue
+            # Every class is recorded: one that subclasses RequestHandler only
+            # through a project base (`class Api(BaseView)`) is resolved later.
             cls = HandlerClass(
                 file=rel,
                 name=node.name,
                 bases=[b.split(".")[-1] for b in bases if b],
                 websocket=any("WebSocket" in b for b in bases),
+                direct=any(b.endswith("Handler") for b in bases),
             )
             for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name in _VERBS:
@@ -123,9 +125,12 @@ def resolve_tornado(files: list[TornadoFile]) -> list[TornadoRoute]:
             return same[0]
         return found[0] if len(found) == 1 else None
 
-    def verbs(cls: HandlerClass) -> tuple[dict[str, bool], bool]:
+    def verbs(cls: HandlerClass) -> tuple[dict[str, bool], bool, bool]:
+        """(verb → authenticated, websocket, is a handler) through up to
+        _MAX_INHERIT levels of bases."""
         methods: dict[str, bool] = {}
         websocket = cls.websocket
+        handler = cls.direct
         seen: set[int] = set()
         current: list[HandlerClass] = [cls]
         for _ in range(_MAX_INHERIT + 1):
@@ -135,6 +140,7 @@ def resolve_tornado(files: list[TornadoFile]) -> list[TornadoRoute]:
                     continue
                 seen.add(id(c))
                 websocket = websocket or c.websocket
+                handler = handler or c.direct
                 for verb, authed in c.methods.items():
                     methods.setdefault(verb, authed)
                 for base in c.bases:
@@ -142,16 +148,16 @@ def resolve_tornado(files: list[TornadoFile]) -> list[TornadoRoute]:
                     if parent is not None:
                         nxt.append(parent)
             current = nxt
-        return methods, websocket
+        return methods, websocket, handler
 
     routes: list[TornadoRoute] = []
     for f in files:
         for spec in f.specs:
             cls = lookup(spec.handler, spec.file)
-            if cls is None and not spec.handler.endswith("Handler"):
+            methods, websocket, handler = verbs(cls) if cls is not None else ({}, False, False)
+            if not handler and not spec.handler.endswith("Handler"):
                 continue
             path = _path(spec.pattern)
-            methods, websocket = verbs(cls) if cls is not None else ({}, False)
             if websocket:
                 routes.append(TornadoRoute(path, "WS", spec.file, spec.line))
                 continue

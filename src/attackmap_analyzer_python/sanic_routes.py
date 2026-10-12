@@ -11,9 +11,32 @@ from __future__ import annotations
 
 import ast
 
-from ._pyast import call_name, keyword, safe_parse, str_const, str_list
+from ._pyast import call_name, keyword, safe_parse, str_const
 
 _RECEIVERS = {"app", "bp", "blueprint"}
+
+
+def _normalize(path: str) -> str:
+    """Leading slash, no `//` runs: the shape core gives the same decorator."""
+    path = "/" + path.strip().lstrip("/")
+    while "//" in path:
+        path = path.replace("//", "/")
+    return path
+
+
+def _methods(node: ast.expr | None) -> list[str]:
+    """`methods=["GET", "post"]`, a tuple/set, or `HTTPMethod.DELETE` enums."""
+    if node is None:
+        return []
+    elts = node.elts if isinstance(node, (ast.List, ast.Tuple, ast.Set)) else [node]
+    out: list[str] = []
+    for elt in elts[:16]:
+        value = str_const(elt)
+        if value is None and isinstance(elt, ast.Attribute):
+            value = elt.attr  # HTTPMethod.DELETE
+        if value and value.isalpha():
+            out.append(value.upper())
+    return out
 
 
 def sanic_routes(content: str) -> list[tuple[str, str, int]] | None:
@@ -41,11 +64,11 @@ def sanic_routes(content: str) -> list[tuple[str, str, int]] | None:
             path = str_const(dec.args[0] if dec.args else keyword(dec, "uri"))
             if path is None:
                 continue
-            path = "/" + path.lstrip("/")
+            path = _normalize(path)
             if kind == "websocket":
                 out.append((path, "WS", dec.lineno))
                 continue
-            methods = [m.upper() for m in (str_list(keyword(dec, "methods")) or []) if m.isalpha()] or ["GET"]
+            methods = _methods(keyword(dec, "methods")) or ["GET"]
             for method in dict.fromkeys(methods):
                 out.append((path, method, dec.lineno))
     return out

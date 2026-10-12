@@ -343,6 +343,15 @@ def resolve_litestar(files: list[LitestarFile]) -> list[LitestarRoute]:
         for handler in f.handlers:
             for prefix, inherited in (mounts(handler.name, f.rel) if handler.module_level else [("", [])]):
                 emit(handler, prefix, "", inherited)
+    # One handler mounted twice at the same path with different auth (a
+    # guarded and an unguarded router) collapses to one route downstream, so
+    # its auth isn't known.
+    auth_by_key: dict[tuple[str, str, str], set[str]] = {}
+    for route in routes:
+        auth_by_key.setdefault((route.path, route.method, route.file), set()).add(route.auth)
+    for route in routes:
+        if len(auth_by_key[(route.path, route.method, route.file)]) > 1:
+            route.auth, route.guards, route.evidence = "unknown", [], None
     return routes
 
 
