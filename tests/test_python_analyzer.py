@@ -74,7 +74,9 @@ def test_django_re_path_extracts_routes(tmp_path: Path) -> None:
     )
     result = PythonAnalyzer().analyze(tmp_path)
     paths = {r.path for r in result.routes}
-    assert "^api/v1/users/$" in paths
+    # Regex anchors are stripped so re_path routes join like path() ones (#2).
+    assert "/api/v1/users/" in paths
+    assert "/api/v1/users/(?P<pk>\\d+)/" in paths
 
 
 def test_drf_router_register_extracts_routes(tmp_path: Path) -> None:
@@ -92,8 +94,8 @@ def test_drf_router_register_extracts_routes(tmp_path: Path) -> None:
     )
     result = PythonAnalyzer().analyze(tmp_path)
     paths = {r.path for r in result.routes}
-    assert "/users" in paths
-    assert "/orders" in paths
+    # The router is mounted under api/ (#2); the include() line isn't a route.
+    assert paths == {"/api/users", "/api/orders"}
 
 
 def test_drf_api_view_methods_emit_framework_hints(tmp_path: Path) -> None:
@@ -650,8 +652,8 @@ def test_full_django_drf_signal_set(tmp_path: Path) -> None:
 
     # Routes
     paths = {r.path for r in result.routes}
-    assert "/charges" in paths
-    assert "/api/" in paths
+    assert "/api/charges" in paths
+    assert "/api/" not in paths  # include(router.urls) is a prefix, not an endpoint
     assert "/api/admin/refund/" in paths
 
     # Database
