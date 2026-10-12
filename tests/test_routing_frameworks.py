@@ -881,3 +881,43 @@ def test_django_patterns_with_many_arguments_keep_prefix(tmp_path: Path) -> None
     ))
     _write(tmp_path, "tm_urls.py", f"from django.conf.urls import patterns, url\nurlpatterns = patterns('', {urls})\n")
     assert _paths(tmp_path) == {f"/tm/p{i}/" for i in range(40)}
+
+
+@pytest.mark.parametrize("source", [
+    # reassignment
+    "urlpatterns = [path('secret/', login_required(views.a))]\n"
+    "urlpatterns = [path('secret/', views.b)]\n",
+    # if/else alternatives
+    "if settings.LOCKED:\n"
+    "    urlpatterns = [path('secret/', login_required(views.a))]\n"
+    "else:\n"
+    "    urlpatterns = [path('secret/', views.b)]\n",
+    # the unguarded version first
+    "urlpatterns = [path('secret/', views.b)]\n"
+    "urlpatterns += [path('secret/', staff_member_required(views.a))]\n",
+])
+def test_django_conflicting_auth_versions_are_unknown(tmp_path: Path, source: str) -> None:
+    _write(tmp_path, "urls.py", "from django.urls import path\n" + source)
+    routes = [r for r in PythonAnalyzer().analyze(tmp_path).routes if r.path == "/secret/"]
+    assert len(routes) == 1
+    assert (routes[0].auth, routes[0].guards, routes[0].guard_evidence) == ("unknown", [], None)
+
+
+def test_django_same_auth_versions_keep_auth(tmp_path: Path) -> None:
+    _write(tmp_path, "urls.py", (
+        "from django.urls import path\n"
+        "urlpatterns = [path('secret/', login_required(views.a))]\n"
+        "urlpatterns = [path('secret/', login_required(views.b))]\n"
+    ))
+    routes = [r for r in PythonAnalyzer().analyze(tmp_path).routes if r.path == "/secret/"]
+    assert len(routes) == 1 and routes[0].auth == "required"
+
+
+def test_append_unique_route_never_first_wins_on_auth() -> None:
+    from attackmap_analyzer_python.contracts import ScanResult
+    for seen in (None, {}):
+        result = ScanResult(root="/r")
+        PythonAnalyzer._append_unique_route(result, "/x", "GET", "a.py", 1, seen=seen, auth="anonymous")
+        PythonAnalyzer._append_unique_route(result, "/x", "GET", "a.py", 2, seen=seen, auth="required", guards=["g"])
+        assert len(result.routes) == 1
+        assert (result.routes[0].auth, result.routes[0].guards) == ("unknown", [])

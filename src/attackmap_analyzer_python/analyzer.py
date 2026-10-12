@@ -360,7 +360,7 @@ class _RouteState:
     litestar: list[LitestarFile] = field(default_factory=list)
     tornado: list[TornadoFile] = field(default_factory=list)
     project_dirs: list[str] = field(default_factory=list)
-    seen: set[tuple[str, str, str]] = field(default_factory=set)
+    seen: dict[tuple[str, str, str], Route] = field(default_factory=dict)
 
 
 class PythonAnalyzer:
@@ -694,24 +694,30 @@ class PythonAnalyzer:
         file: str,
         line: int | None,
         *,
-        seen: set[tuple[str, str, str]] | None = None,
+        seen: dict[tuple[str, str, str], Route] | None = None,
         auth: str = "unknown",
         guards: list[str] | None = None,
         guard_evidence: str | None = None,
     ) -> None:
         key = (path, method, file)
         if seen is not None:
-            if key in seen:
-                return
-            seen.add(key)
-        elif any((item.path, item.method, item.file) == key for item in result.routes):
+            existing = seen.get(key)
+        else:
+            existing = next((item for item in result.routes if (item.path, item.method, item.file) == key), None)
+        if existing is not None:
+            # Never first-wins on auth: the same route emitted twice with
+            # different auth (a reassigned or if/else `urlpatterns`, two
+            # mounts) isn't known to be guarded, so it becomes `unknown`.
+            if existing.auth != auth:
+                existing.auth, existing.guards, existing.guard_evidence = "unknown", [], None
             return
-        result.routes.append(
-            Route(
-                path=path, method=method, file=file, line=line,
-                auth=auth, guards=list(guards or []), guard_evidence=guard_evidence,
-            )
+        route = Route(
+            path=path, method=method, file=file, line=line,
+            auth=auth, guards=list(guards or []), guard_evidence=guard_evidence,
         )
+        if seen is not None:
+            seen[key] = route
+        result.routes.append(route)
 
     @staticmethod
     def _append_unique_database(result: ScanResult, kind: str, file: str, line: int | None, evidence: str | None) -> None:
