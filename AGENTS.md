@@ -17,7 +17,7 @@ This analyzer should:
 ## Scope
 Comprehensive Python ecosystem coverage, **additive over the built-in `python-web` analyzer**:
 
-- **Web frameworks**: Django (`path/re_path/url`, gated by `urlpatterns =`), DRF routers (`router.register`, `@api_view`), Starlette (`Route` + `WebSocketRoute`), AIOHTTP (`add_get/post/...` and `web.get/post/...`), Sanic (`@app.get/post`), Litestar / Starlite (top-level `@get/@post` decorators), Flask `add_url_rule`
+- **Web frameworks**: Django (`path/re_path/url`, gated by `urlpatterns =`, with the `include()` graph joined repo-wide in `django_urls.py`), DRF routers (`*Router().register`, mounted under their include prefix; `@api_view`), Starlette (`Route` + `WebSocketRoute`), AIOHTTP (`add_get/post/...`, `add_route`, `web.get/post/...`, `RouteTableDef` decorators), Sanic (`@app.get/post`, `@app.route(methods=[...])`), Litestar / Starlite (handlers, `Controller.path`, `Router` prefixes and guards in `litestar_routes.py`), Tornado (URLSpecs + `RequestHandler` methods in `tornado_routes.py`), Flask `add_url_rule`
 - **Databases**: SQLAlchemy with dialect-aware kind inference, asyncpg / psycopg2-3 / pymysql / motor / pymongo / redis-py / aioredis / sqlmodel / tortoise; boto3 dynamodb / s3; Django `DATABASES` dict in settings.py
 - **Auth**: passlib (CryptContext + argon2/bcrypt/scrypt sub-hashes), bcrypt standalone, argon2-cffi, PyJWT / python-jose, authlib (OAuth/OAuth2Session), fastapi-users (BearerTransport / JWTStrategy), flask-jwt-extended (`@jwt_required`, `create_access_token`), django.contrib.auth (`authenticate`, `make_password`), casbin
 - **HTTP clients**: httpx (sync + async), aiohttp.ClientSession, urllib.request.urlopen
@@ -25,7 +25,6 @@ Comprehensive Python ecosystem coverage, **additive over the built-in `python-we
 - **Service hints**: `[project] name` from pyproject.toml (PEP 621), `[tool.poetry] name`, setup.py `name=`, setup.cfg `[metadata] name`, `manage.py` → `framework:django`, Django `INSTALLED_APPS` (filtering out `django.*` built-ins)
 
 ## Out of scope (for now)
-- **Tornado** class-based `RequestHandler` routing — requires per-class method extraction (`def get(self):`/`def post(self):` inside a class body).
 - **FastAPI APIRouter prefix joining** beyond what the core scanner already handles.
 - **Type-annotation–based DI** for FastAPI auth (`Depends(get_current_user)`) — already partially in core via AUTH_PATTERNS.
 - **Celery** task definitions as background-worker entrypoints — only framework presence is captured.

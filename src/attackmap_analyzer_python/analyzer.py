@@ -5,12 +5,15 @@ the built-in (which uses the core scanner) handles FastAPI / Flask routes,
 basic auth keyword sweeps, and standard `os.getenv` / SECRET_PATTERNS. This
 plugin adds:
 
-- **Django** routing (path / re_path / include / DRF routers), settings.py
-  DATABASES dict parsing, INSTALLED_APPS, manage.py detection
+- **Django** routing (path / re_path / url) with the include() graph joined
+  onto child routes (`django_urls`), DRF routers, settings.py DATABASES dict
+  parsing, INSTALLED_APPS, manage.py detection
 - **Starlette** Route(...) declarations
-- **AIOHTTP** (`add_get` / `add_post` / `web.get` / `web.post`)
-- **Sanic** decorator routes (`@app.get`, `@app.post`)
-- **Litestar** (formerly Starlite) decorator routes
+- **AIOHTTP** (`add_get` / `add_route` / `web.get` / `RouteTableDef`)
+- **Sanic** decorator routes (`@app.get`, `@app.route(methods=[...])`)
+- **Litestar** (formerly Starlite) handlers, controllers and routers
+  (`litestar_routes`)
+- **Tornado** URLSpecs paired with RequestHandler methods (`tornado_routes`)
 - **SQLAlchemy** (`create_engine("postgresql://...")` with dialect-aware kind)
 - **asyncpg / pymysql / motor.motor_asyncio** databases
 - **boto3** resource detection (DynamoDB, S3)
@@ -33,7 +36,9 @@ single unified set of findings even though both analyzers fire.
 
 from __future__ import annotations
 
+import posixpath
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
@@ -50,6 +55,10 @@ from .contracts import (
     SecretHint,
     ServiceHint,
 )
+from .django_urls import UrlConf, UrlGraph, join_segments, parse_urlconf
+from .litestar_routes import LitestarFile, parse_litestar, resolve_litestar
+from .sanic_routes import sanic_routes
+from .tornado_routes import TornadoFile, parse_tornado, resolve_tornado
 
 CODE_SUFFIXES = {".py"}
 # Python-specific directories on top of the SDK defaults. Matched against
@@ -60,9 +69,11 @@ _SNIPPET_MAX_CHARS = 160
 
 # ---------- Patterns ----------
 
-# Django: path("users/", views.users) / path("users/", views.users, name="users")
+# Django: path("users/", views.users) / path("", views.home). These regexes are
+# the fallback for a URLconf `ast` can't parse (Python 2, huge); parseable ones
+# go through the include() graph in `django_urls`.
 DJANGO_PATH_PATTERN = re.compile(
-    r'\bpath\s*\(\s*[\'"]([^\'"]+)[\'"]\s*,',
+    r'\bpath\s*\(\s*[\'"]([^\'"]*)[\'"]\s*,',
 )
 # Django: re_path(r"^users/$", views.users)
 DJANGO_RE_PATH_PATTERN = re.compile(
@@ -101,6 +112,26 @@ AIOHTTP_WEB_HELPER_PATTERN = re.compile(
     r'\bweb\.(get|post|put|delete|patch|head|options)\s*\(\s*[\'"]([^\'"]+)[\'"]',
     re.IGNORECASE,
 )
+# app.router.add_route("POST", "/x", h) / add_route("*", "/x", h)
+AIOHTTP_ADD_ROUTE_PATTERN = re.compile(
+    r'\badd_route\s*\(\s*[\'"]([A-Za-z]+|\*)[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]',
+)
+# app.router.add_view("/x", View) / web.view("/x", View): class-based, any verb
+AIOHTTP_VIEW_PATTERN = re.compile(
+    r'\b(?:add_view|web\.view)\s*\(\s*[\'"]([^\'"]+)[\'"]',
+)
+# routes = web.RouteTableDef(), then @routes.get("/x") / @routes.view("/x") /
+# @routes.route("POST", "/x"). Decorators count only on a RouteTableDef name.
+AIOHTTP_ROUTE_TABLE_PATTERN = re.compile(
+    r'^[ \t]*(\w+)[ \t]*(?::[^=\n]*)?=[ \t]*(?:\w+\.)?RouteTableDef[ \t]*\(',
+    re.MULTILINE,
+)
+AIOHTTP_TABLE_DECORATOR_PATTERN = re.compile(
+    r'@(\w+)\.(get|post|put|delete|patch|head|options|view)\s*\(\s*[\'"]([^\'"]*)[\'"]',
+)
+AIOHTTP_TABLE_ROUTE_PATTERN = re.compile(
+    r'@(\w+)\.route\s*\(\s*[\'"]([A-Za-z]+|\*)[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]',
+)
 
 # Sanic: @app.get("/x"), @bp.post("/x")
 SANIC_DECORATOR_PATTERN = re.compile(
@@ -108,13 +139,16 @@ SANIC_DECORATOR_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Litestar (and legacy Starlite): @get("/x"), @post("/x") top-level decorators
-# Only fire when the file imports from litestar/starlite to avoid mis-firing on
-# generic identifiers named `get` or `post`.
+# Litestar (and legacy Starlite): @get("/x"), @post("/x") decorators. The
+# `litestar_routes` ast pass handles controllers/routers; this regex is the
+# fallback for a file it can't parse. Only fires when the file imports from
+# litestar/starlite to avoid mis-firing on generic `get`/`post` identifiers.
 LITESTAR_DECORATOR_PATTERN = re.compile(
-    r'^@(get|post|put|delete|patch|head|options)\s*\(\s*[\'"]([^\'"]+)[\'"]',
+    r'^[ \t]*@(get|post|put|delete|patch|head|options)\s*\(\s*[\'"]([^\'"]+)[\'"]',
     re.MULTILINE,
 )
+
+TORNADO_IMPORT_PATTERN = re.compile(r'^[ \t]*(?:from|import)[ \t]+tornado\b', re.MULTILINE)
 
 # Flask add_url_rule (less common but valid)
 FLASK_ADD_URL_RULE_PATTERN = re.compile(
@@ -304,6 +338,31 @@ def _has_drf_import(content: str) -> bool:
     return "rest_framework" in content
 
 
+def _aiohttp_method(verb: str) -> str:
+    verb = verb.upper()
+    return "ANY" if verb in {"*", "VIEW"} else verb
+
+
+def _normalize_route_path(path: str) -> str:
+    """Leading slash, no `//` runs — the shape core's scanner gives the same
+    decorator, so the two analyzers' routes merge instead of duplicating."""
+    path = "/" + path.strip().lstrip("/")
+    while "//" in path:
+        path = path.replace("//", "/")
+    return path
+
+
+@dataclass
+class _RouteState:
+    """Per-analyze() state for the cross-file route passes."""
+
+    django: dict[str, UrlConf] = field(default_factory=dict)
+    litestar: list[LitestarFile] = field(default_factory=list)
+    tornado: list[TornadoFile] = field(default_factory=list)
+    project_dirs: list[str] = field(default_factory=list)
+    seen: dict[tuple[str, str, str], Route] = field(default_factory=dict)
+
+
 class PythonAnalyzer:
     metadata = AnalyzerMetadata(
         name="python",
@@ -356,6 +415,7 @@ class PythonAnalyzer:
         if (root / "manage.py").exists():
             self._append_unique_service(result, "framework:django", "manage.py")
 
+        state = _RouteState()
         for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
             content = read_source(file_path, root=root)
             if content is None:
@@ -366,7 +426,9 @@ class PythonAnalyzer:
                 result.languages.append("python")
 
             relative = rel(file_path, root)
-            self._extract_routes(content, relative, result)
+            if posixpath.basename(relative) == "manage.py":
+                state.project_dirs.append(posixpath.dirname(relative))
+            self._extract_routes(content, relative, result, state)
             self._extract_databases(content, relative, result)
             self._extract_django_settings(content, relative, result)
             self._extract_auth(content, relative, result)
@@ -375,29 +437,43 @@ class PythonAnalyzer:
             self._extract_frameworks(content, relative, result)
             self._extract_entrypoints(content, relative, result)
 
+        self._finish_routes(result, state)
         result.languages.sort()
         return result
 
     # ---------- Extractors ----------
 
-    def _extract_routes(self, content: str, relative: str, result: ScanResult) -> None:
-        # Django routing only fires inside files that look like urls.py
-        if _has_django_import(content) and _is_django_urls(content):
-            for match in DJANGO_PATH_PATTERN.finditer(content):
-                path = "/" + match.group(1).lstrip("/")
-                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
-            for match in DJANGO_RE_PATH_PATTERN.finditer(content):
-                path = match.group(1)
-                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
-            for match in DJANGO_LEGACY_URL_PATTERN.finditer(content):
-                path = match.group(1)
-                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
+    def _extract_routes(self, content: str, relative: str, result: ScanResult, state: "_RouteState") -> None:
+        def add(path: str, method: str, line: int | None) -> None:
+            self._append_unique_route(result, path, method, relative, line, seen=state.seen)
 
-        # Django REST Framework routers
-        if _has_drf_import(content):
-            for match in DRF_ROUTER_PATTERN.finditer(content):
-                path = "/" + match.group(1).lstrip("/")
-                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
+        # Django URLconfs and DRF router modules go into the include() graph,
+        # resolved once every file is read (`_finish_routes`).
+        is_urlconf = _has_django_import(content) and _is_django_urls(content)
+        drf = _has_drf_import(content)
+        conf: UrlConf | None = None
+        if is_urlconf or (".register(" in content and "Router(" in content):
+            conf = parse_urlconf(content, relative, is_urlconf=is_urlconf, drf=drf)
+            if conf is not None:
+                state.django[relative] = conf
+        if conf is None:
+            # Not parseable (Python 2, oversized): the per-file regex fallback.
+            if is_urlconf:
+                for pattern, regex in (
+                    (DJANGO_PATH_PATTERN, False),
+                    (DJANGO_RE_PATH_PATTERN, True),
+                    (DJANGO_LEGACY_URL_PATTERN, True),
+                ):
+                    for match in pattern.finditer(content):
+                        path = join_segments([(match.group(1), regex)])
+                        if path == "/" and content[match.end() : match.end() + 200].lstrip().startswith("include"):
+                            continue  # path("", include(...)): a mount point, not an endpoint
+                        add(path, "ANY", line_of(content, match.start()))
+            if drf:
+                for match in DRF_ROUTER_PATTERN.finditer(content):
+                    add("/" + match.group(1).lstrip("/"), "ANY", line_of(content, match.start()))
+
+        if drf:
             for match in DJANGO_API_VIEW_PATTERN.finditer(content):
                 methods = re.findall(r'[\'"]([A-Z]+)[\'"]', match.group(1))
                 # No path on @api_view alone — caller must pair with path() in urls.py.
@@ -421,37 +497,66 @@ class PythonAnalyzer:
                 else:
                     methods = ["ANY"]
                 for method in methods:
-                    self._append_unique_route(result, path, method, relative, line)
+                    add(path, method, line)
             for match in STARLETTE_WS_PATTERN.finditer(content):
-                path = match.group(1)
-                self._append_unique_route(result, path, "WS", relative, line_of(content, match.start()))
+                add(match.group(1), "WS", line_of(content, match.start()))
 
         # AIOHTTP — gated by import presence so generic `add_get`/`web.get` doesn't fire.
         if _has_aiohttp_import(content):
             for match in AIOHTTP_ADD_PATTERN.finditer(content):
-                method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+                add(match.group(2), match.group(1).upper(), line_of(content, match.start()))
             for match in AIOHTTP_WEB_HELPER_PATTERN.finditer(content):
-                method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+                add(match.group(2), match.group(1).upper(), line_of(content, match.start()))
+            for match in AIOHTTP_ADD_ROUTE_PATTERN.finditer(content):
+                add(match.group(2), _aiohttp_method(match.group(1)), line_of(content, match.start()))
+            for match in AIOHTTP_VIEW_PATTERN.finditer(content):
+                add(match.group(1), "ANY", line_of(content, match.start()))
+            tables = {m.group(1) for m in AIOHTTP_ROUTE_TABLE_PATTERN.finditer(content)}
+            if tables:
+                for match in AIOHTTP_TABLE_DECORATOR_PATTERN.finditer(content):
+                    if match.group(1) in tables:
+                        add(_normalize_route_path(match.group(3)), _aiohttp_method(match.group(2)), line_of(content, match.start()))
+                for match in AIOHTTP_TABLE_ROUTE_PATTERN.finditer(content):
+                    if match.group(1) in tables:
+                        add(_normalize_route_path(match.group(3)), _aiohttp_method(match.group(2)), line_of(content, match.start()))
 
         # Sanic — gated by sanic import
         if _has_sanic_import(content):
             for match in SANIC_DECORATOR_PATTERN.finditer(content):
-                method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+                add(match.group(2), match.group(1).upper(), line_of(content, match.start()))
+            if ".route(" in content or ".websocket(" in content:
+                for path, method, line in sanic_routes(content) or []:
+                    add(path, method, line)
 
-        # Litestar / Starlite — gated to avoid false positives on generic `@get(...)` decorators.
+        # Litestar / Starlite — decorators count only when imported from litestar.
         if _has_litestar_or_starlite_import(content):
-            for match in LITESTAR_DECORATOR_PATTERN.finditer(content):
-                method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+            litestar = parse_litestar(content, relative)
+            if litestar is not None:
+                state.litestar.append(litestar)
+            else:
+                for match in LITESTAR_DECORATOR_PATTERN.finditer(content):
+                    add(match.group(2), match.group(1).upper(), line_of(content, match.start()))
+
+        # Tornado — URLSpecs are paired with handler classes repo-wide.
+        if "tornado" in content and TORNADO_IMPORT_PATTERN.search(content):
+            tornado = parse_tornado(content, relative)
+            if tornado is not None:
+                state.tornado.append(tornado)
 
         # Flask add_url_rule (additive — built-in covers @app.route)
         if "flask" in content.lower() or "Blueprint(" in content:
             for match in FLASK_ADD_URL_RULE_PATTERN.finditer(content):
-                path = match.group(1)
-                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
+                add(match.group(1), "ANY", line_of(content, match.start()))
+
+    def _finish_routes(self, result: ScanResult, state: "_RouteState") -> None:
+        """Routes that need every file first: the Django include() graph,
+        Litestar router/controller joins, Tornado handler classes."""
+        graph = UrlGraph(state.django, state.project_dirs)
+        for route in [*graph.expand(), *resolve_litestar(state.litestar), *resolve_tornado(state.tornado)]:
+            self._append_unique_route(
+                result, route.path, route.method, route.file, route.line,
+                seen=state.seen, auth=route.auth, guards=route.guards, guard_evidence=route.evidence,
+            )
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
@@ -582,11 +687,37 @@ class PythonAnalyzer:
     # ---------- Append helpers ----------
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int | None) -> None:
+    def _append_unique_route(
+        result: ScanResult,
+        path: str,
+        method: str,
+        file: str,
+        line: int | None,
+        *,
+        seen: dict[tuple[str, str, str], Route] | None = None,
+        auth: str = "unknown",
+        guards: list[str] | None = None,
+        guard_evidence: str | None = None,
+    ) -> None:
         key = (path, method, file)
-        if any((item.path, item.method, item.file) == key for item in result.routes):
+        if seen is not None:
+            existing = seen.get(key)
+        else:
+            existing = next((item for item in result.routes if (item.path, item.method, item.file) == key), None)
+        if existing is not None:
+            # Never first-wins on auth: the same route emitted twice with
+            # different auth (a reassigned or if/else `urlpatterns`, two
+            # mounts) isn't known to be guarded, so it becomes `unknown`.
+            if existing.auth != auth:
+                existing.auth, existing.guards, existing.guard_evidence = "unknown", [], None
             return
-        result.routes.append(Route(path=path, method=method, file=file, line=line))
+        route = Route(
+            path=path, method=method, file=file, line=line,
+            auth=auth, guards=list(guards or []), guard_evidence=guard_evidence,
+        )
+        if seen is not None:
+            seen[key] = route
+        result.routes.append(route)
 
     @staticmethod
     def _append_unique_database(result: ScanResult, kind: str, file: str, line: int | None, evidence: str | None) -> None:
