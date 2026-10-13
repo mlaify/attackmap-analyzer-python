@@ -914,7 +914,7 @@ def test_django_same_auth_versions_keep_auth(tmp_path: Path) -> None:
 
 
 def test_append_unique_route_never_first_wins_on_auth() -> None:
-    from attackmap_analyzer_python.contracts import ScanResult
+    from attackmap.sdk import ScanResult
     for seen in (None, {}):
         result = ScanResult(root="/r")
         PythonAnalyzer._append_unique_route(result, "/x", "GET", "a.py", 1, seen=seen, auth="anonymous")
