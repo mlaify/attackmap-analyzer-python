@@ -41,20 +41,24 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
-
-from .contracts import (
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
     DatabaseHint,
     EntrypointHint,
     ExternalCall,
     FrameworkHint,
+    iter_repo_files,
+    line_of,
+    read_source,
+    rel,
     Route,
     ScanResult,
     SecretHint,
     ServiceHint,
 )
+
 from .django_urls import UrlConf, UrlGraph, join_segments, parse_urlconf
 from .litestar_routes import LitestarFile, parse_litestar, resolve_litestar
 from .sanic_routes import sanic_routes
