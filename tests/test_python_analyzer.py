@@ -400,7 +400,7 @@ def test_passlib_argon2_bcrypt_high_confidence(tmp_path: Path) -> None:
 
 def test_pyjwt_jose_jwt_emit_jwt_hint(tmp_path: Path) -> None:
     (tmp_path / "auth1.py").write_text(
-        "import jwt\ntoken = jwt.encode({'sub': 'x'}, 'secret')\n",
+        "import jwt\nclaims = jwt.decode(token, 'secret', algorithms=['HS256'])\n",
         encoding="utf-8",
     )
     (tmp_path / "auth2.py").write_text(
@@ -408,7 +408,49 @@ def test_pyjwt_jose_jwt_emit_jwt_hint(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     result = PythonAnalyzer().analyze(tmp_path)
-    assert any(h.hint == "jwt" for h in result.auth_hints)
+    assert {(h.file, h.line) for h in result.auth_hints if h.hint == "jwt"} == {("auth1.py", 2), ("auth2.py", 2)}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "import jwt\n",
+        "from jose import jwt\n# TODO: jwt.verify the token\n",
+        "import jwt\ntoken = jwt.encode({'sub': 'x'}, 'secret')\n",
+        "import jwt\nc = jwt.decode(t, options={'verify_signature': False})\n",
+        'import jwt\nc = jwt.decode(t, key, algorithms=["HS256"],\n    options={"verify_signature": False})\n',
+        "import jwt\nc = jwt.decode(t, verify=False)\n",
+    ],
+)
+def test_jwt_hint_needs_a_verifying_decode(tmp_path: Path, body: str) -> None:
+    (tmp_path / "auth.py").write_text(body, encoding="utf-8")
+    result = PythonAnalyzer().analyze(tmp_path)
+    assert not any(h.hint == "jwt" for h in result.auth_hints)
+
+
+def test_jwt_hint_skips_unverified_decode_for_a_later_verified_one(tmp_path: Path) -> None:
+    (tmp_path / "auth.py").write_text(
+        "import jwt\n"
+        "hdr = jwt.decode(t, options={'verify_signature': False})\n"
+        "claims = jwt.decode(t, key, algorithms=['RS256'])\n",
+        encoding="utf-8",
+    )
+    hints = [h for h in PythonAnalyzer().analyze(tmp_path).auth_hints if h.hint == "jwt"]
+    assert [h.line for h in hints] == [3]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("from flask_jwt_extended import create_access_token\nt = create_access_token(identity=u)\n", False),
+        ("from flask_jwt_extended import jwt_required\n@jwt_required()\ndef me():\n    pass\n", True),
+        ("from flask_jwt_extended import verify_jwt_in_request\nverify_jwt_in_request()\n", True),
+    ],
+)
+def test_flask_jwt_extended_hint_needs_a_check(tmp_path: Path, body: str, expected: bool) -> None:
+    (tmp_path / "auth.py").write_text(body, encoding="utf-8")
+    result = PythonAnalyzer().analyze(tmp_path)
+    assert any(h.hint == "flask_jwt_extended" for h in result.auth_hints) is expected
 
 
 def test_django_auth_signal(tmp_path: Path) -> None:
@@ -642,7 +684,7 @@ def test_full_django_drf_signal_set(tmp_path: Path) -> None:
         "@api_view(['POST'])\n"
         "def refund(request):\n"
         "    user = authenticate(request, username=request.data['u'], password=request.data['p'])\n"
-        "    token = jwt.encode({'sub': user.id}, 'k')\n"
+        "    claims = jwt.decode(request.headers['X-Token'], 'k', algorithms=['HS256'])\n"
         "    httpx.post('https://api.stripe.com/v1/refunds')\n"
         "    return None\n",
         encoding="utf-8",
