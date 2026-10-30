@@ -198,16 +198,23 @@ DJANGO_ENGINE_PATTERN = re.compile(
 )
 
 
-# Auth libraries
+# Auth libraries. Core credits any auth hint near a route as that route's auth,
+# so JWT hints come from checks only (AttackMap#325): signing a token, importing
+# the library or mentioning it authenticates nobody.
 AUTH_PATTERNS: list[tuple[re.Pattern[str], str, float]] = [
     (re.compile(r'\bpasslib\.\w+|\bCryptContext\s*\('), "passlib", 0.85),
     (re.compile(r'\bpasslib\.hash\.argon2\b|\bargon2\.PasswordHasher\b|\bfrom\s+argon2\s+import'), "argon2", 0.9),
     (re.compile(r'\bpasslib\.hash\.bcrypt\b|\bbcrypt\.hashpw\s*\(|\bbcrypt\.checkpw\s*\(|\bimport\s+bcrypt\b'), "bcrypt", 0.9),
     (re.compile(r'\bpasslib\.hash\.scrypt\b'), "scrypt", 0.9),
-    (re.compile(r'\bjwt\.(?:encode|decode)\s*\(|\bfrom\s+jose\s+import\s+jwt\b|\bjose\.jwt\b'), "jwt", 0.85),
+    # PyJWT / python-jose `jwt.decode(` verifies unless the call turns it off
+    # (`options={"verify_signature": False}`, PyJWT 1.x `verify=False`).
+    (re.compile(
+        r'\bjwt\.decode\s*\((?![^)]{0,400}?(?:[\'"]verify_signature[\'"]\s*:\s*False|\bverify\s*=\s*False))'
+    ), "jwt", 0.85),
     (re.compile(r'\bauthlib\.\w+|\bOAuth\(\s*\)|\bOAuth2Session\s*\('), "oauth", 0.85),
     (re.compile(r'\bfastapi_users\.\w+|\bBearerTransport\s*\(|\bJWTStrategy\s*\('), "fastapi_users", 0.85),
-    (re.compile(r'@jwt_required\b|\bcreate_access_token\s*\(|\bflask_jwt_extended\b'), "flask_jwt_extended", 0.85),
+    # `create_access_token(` issues a token and the module name is an import.
+    (re.compile(r'@jwt_required\b|\bverify_jwt_in_request\s*\('), "flask_jwt_extended", 0.85),
     (re.compile(r'\bdjango\.contrib\.auth\b|\bauthenticate\s*\(\s*request\b|\bmake_password\s*\('), "django_auth", 0.85),
     (re.compile(r'\bcasbin\.Enforcer\s*\(|\bfrom\s+casbin\b'), "casbin", 0.9),
     (re.compile(r'\bAuthorization\b'), "authorization_header", 0.6),

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — JWT auth hints need a check (#7, AttackMap#325)
+
+- The `jwt` auth hint now comes only from a PyJWT / python-jose `jwt.decode(` that verifies. A decode with `options={"verify_signature": False}` or PyJWT 1.x `verify=False` is skipped, and a later verified decode in the same file is still found. `jwt.encode(` (signing), `from jose import jwt` and `jose.jwt` no longer count. Core credits any auth hint near a route as that route's auth, so a file that only issued tokens made its routes look protected.
+- `flask_jwt_extended` likewise needs `@jwt_required` or `verify_jwt_in_request(`. `create_access_token(` issues a token, and the module name is an import.
+- On zulip@0399249, the only remaining `jwt` hint is `zerver/views/auth.py:646` (a decode with `verify_signature: True`, also core's `jwt_verified`). The `jwt.encode` hint in a test file is gone. Findings are unchanged.
+
 ### Added
 
 - Django `include()` graph ([#2](https://github.com/mlaify/attackmap-analyzer-python/issues/2)):
