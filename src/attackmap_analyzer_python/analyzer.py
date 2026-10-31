@@ -378,7 +378,7 @@ class PythonAnalyzer:
     metadata = AnalyzerMetadata(
         name="python",
         display_name="Python Comprehensive Analyzer",
-        version="0.1.0",
+        version="0.2.0",
         description="Comprehensive Python analyzer for Django, Starlette, AIOHTTP, Sanic, Litestar, DRF; SQLAlchemy/asyncpg/motor; passlib/PyJWT/authlib; httpx/aiohttp.",
         scope="Python projects (pyproject.toml, setup.py, manage.py, or any *.py tree). Additive over the built-in python-web analyzer.",
         targets=["python", "django", "starlette", "aiohttp", "sanic", "litestar"],
