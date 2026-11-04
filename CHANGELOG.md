@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-31
+
+### Changed — packaging
+
+- Released to the mlaify package index (https://pkg.mlaify.io/pypi/simple/). A `v*` tag now builds the wheel and sdist and attaches them to a GitHub release (`.github/workflows/release.yml`); the index picks them up within six hours.
+- The `core` and `dev` extras require `attackmap>=0.6.0` from the index instead of AttackMap's git main.
+
 ### Fixed — JWT auth hints need a check (#7, AttackMap#325)
 
 - The `jwt` auth hint now comes only from a PyJWT / python-jose `jwt.decode(` that verifies. A decode with `options={"verify_signature": False}` or PyJWT 1.x `verify=False` is skipped, and a later verified decode in the same file is still found. `jwt.encode(` (signing), `from jose import jwt` and `jose.jwt` no longer count. Core credits any auth hint near a route as that route's auth, so a file that only issued tokens made its routes look protected.
@@ -92,5 +99,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Emits Signal-v2 records (`file:line` citation, evidence text, and confidence
   score) for every signal.
 
-[Unreleased]: https://github.com/mlaify/attackmap-analyzer-python/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mlaify/attackmap-analyzer-python/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mlaify/attackmap-analyzer-python/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mlaify/attackmap-analyzer-python/releases/tag/v0.1.0
