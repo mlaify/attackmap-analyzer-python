@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "attackmap-analyzer-python"
-version = "0.2.0"
+version = "0.2.1"
 description = "Comprehensive Python ecosystem analyzer plugin for AttackMap (Django, Starlette, AIOHTTP, Sanic, Litestar, DRF; SQLAlchemy/asyncpg/motor; passlib/PyJWT/authlib; httpx/aiohttp)."
 readme = "README.md"
 requires-python = ">=3.11"
