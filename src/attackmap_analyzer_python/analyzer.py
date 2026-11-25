@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from attackmap.sdk import (
+    plugin_version,
     DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
@@ -378,7 +379,8 @@ class PythonAnalyzer:
     metadata = AnalyzerMetadata(
         name="python",
         display_name="Python Comprehensive Analyzer",
-        version="0.2.1",
+        version=plugin_version("attackmap-analyzer-python", default="0.2.1"),
+        requires_core=">=0.8,<2",
         description="Comprehensive Python analyzer for Django, Starlette, AIOHTTP, Sanic, Litestar, DRF; SQLAlchemy/asyncpg/motor; passlib/PyJWT/authlib; httpx/aiohttp.",
         scope="Python projects (pyproject.toml, setup.py, manage.py, or any *.py tree). Additive over the built-in python-web analyzer.",
         targets=["python", "django", "starlette", "aiohttp", "sanic", "litestar"],
