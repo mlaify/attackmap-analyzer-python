@@ -379,7 +379,7 @@ class PythonAnalyzer:
     metadata = AnalyzerMetadata(
         name="python",
         display_name="Python Comprehensive Analyzer",
-        version=plugin_version("attackmap-analyzer-python", default="0.2.1"),
+        version=plugin_version("attackmap-analyzer-python", default="0.3.0"),
         requires_core=">=0.8,<2",
         description="Comprehensive Python analyzer for Django, Starlette, AIOHTTP, Sanic, Litestar, DRF; SQLAlchemy/asyncpg/motor; passlib/PyJWT/authlib; httpx/aiohttp.",
         scope="Python projects (pyproject.toml, setup.py, manage.py, or any *.py tree). Additive over the built-in python-web analyzer.",
